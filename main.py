@@ -1,3 +1,20 @@
+# --- BEGIN keepalive server for Koyeb ---
+import threading
+from flask import Flask
+
+def start_keepalive_server():
+    from waitress import serve
+    app = Flask(__name__)
+
+    @app.route('/')
+    def home():
+        return "✅ Bot is alive", 200
+
+    serve(app, host="0.0.0.0", port=8000)
+
+# Run Flask web server in a background thread
+threading.Thread(target=start_keepalive_server, daemon=True).start()
+# --- END keepalive server ---
 import os
 import re
 import json
