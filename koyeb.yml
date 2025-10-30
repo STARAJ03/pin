@@ -3,7 +3,7 @@ regions:
   - fra
 services:
   - name: uploader
-    type: worker                   # 👈 tells Koyeb it’s NOT a web app
+    type: web                   # 👈 tells Koyeb it’s NOT a web app
     ports: []                      # 👈 no open ports = no health check
     env:
       - key: BOT_TOKEN
