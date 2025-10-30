@@ -11,23 +11,27 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Kolkata
 
 # ──────────────────────────────────────────────
-#  System dependencies
+#  System dependencies (includes ffmpeg)
 # ──────────────────────────────────────────────
-RUN pip install --no-cache-dir \
-    pyrogram \
-    tgcrypto \
-    yt-dlp \
-    aiohttp \
-    aiofiles \
-    requests \
-    flask \
-    waitress
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    git \
+    curl \
+    wget \
+    tzdata \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
 
+# ──────────────────────────────────────────────
+#  Working directory
+# ──────────────────────────────────────────────
+WORKDIR /app
 
 # ──────────────────────────────────────────────
 #  Copy project files
 # ──────────────────────────────────────────────
-WORKDIR /app
 COPY . /app
 
 # ──────────────────────────────────────────────
@@ -40,13 +44,15 @@ RUN pip install --no-cache-dir -U pip setuptools wheel \
     yt-dlp \
     aiohttp \
     aiofiles \
-    requests
+    requests \
+    flask \
+    waitress
 
 # ──────────────────────────────────────────────
 #  Runtime environment variables
 # ──────────────────────────────────────────────
 # You can also pass BOT_TOKEN as an environment variable in `docker run`
-#ENV BOT_TOKEN=""
+# ENV BOT_TOKEN=""
 
 # ──────────────────────────────────────────────
 #  Start command
