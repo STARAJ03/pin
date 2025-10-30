@@ -431,7 +431,7 @@ async def start_processing(client: Client, message: Message, user_id: int):
     processed = 0
     failed = 0
     last_subject = None  # Keep track of the previous subject
-    video_count = 0  # Counter for numbering videos
+    video_count = start_idx - 1  # Continue numbering
 
     for idx, entry in enumerate(lines[start_idx - 1:], start=start_idx):
         if not active_downloads.get(user_id, True):
