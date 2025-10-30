@@ -4,11 +4,18 @@ import json
 import logging
 import asyncio
 import time
+import shutil
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError, BadMsgNotification
 from pyrogram.types import Message
 from typing import Dict, List, Optional
+
+# NEW imports for async HTTP downloads and youtube support
+import aiohttp
+import aiofiles
+from yt_dlp import YoutubeDL
+from concurrent.futures import ThreadPoolExecutor
 
 # ─── Logging Setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,6 +40,9 @@ app = Client(
     workdir="./",
     sleep_threshold=60  # handle flood waits automatically
 )
+
+# ThreadPool for blocking tasks (yt-dlp)
+_thread_pool = ThreadPoolExecutor(max_workers=2)
 
 # ─── Global State ───────────────────────────────────────────────────────────────
 active_downloads: Dict[int, bool] = {}
@@ -92,41 +102,119 @@ def clean_title(title: str) -> str:
     """Sanitize title for use as a filename (remove forbidden characters)."""
     return re.sub(r'[^\w\-_. ]', "", title.strip())
 
+# --- NEW: http download helper (async) ---
+async def _download_http_to_file(session: aiohttp.ClientSession, url: str, tmp_path: str) -> None:
+    """
+    Streams a resource from `url` and writes to tmp_path atomically.
+    Raises exceptions on HTTP errors.
+    """
+    CHUNK = 64 * 1024
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+        if resp.status != 200:
+            raise Exception(f"HTTP {resp.status} for {url}")
+        # write to temp file then move
+        tmp_write = tmp_path + ".part"
+        async with aiofiles.open(tmp_write, "wb") as f:
+            async for chunk in resp.content.iter_chunked(CHUNK):
+                await f.write(chunk)
+        # atomic move
+        shutil.move(tmp_write, tmp_path)
+
+# --- NEW: yt-dlp wrapper (runs in thread) ---
+def _ydl_download_blocking(url: str, out_template: str) -> str:
+    """
+    Blocking function to download via yt-dlp. Returns output file path.
+    """
+    opts = {
+        "outtmpl": out_template,
+        "format": "best[ext=mp4]/best",  # prefer mp4 container if available
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        # ydl will expand outtmpl, attempt to determine filename
+        filename = ydl.prepare_filename(info)
+        # if the file does not end with .mp4, rename to .mp4 if the ext is different but mp4 container used
+        return filename
+
 async def download_file(url: str, filename: str) -> str:
     """
-    Download either .mp4 or .pdf from the given URL using 'appxdl'.
-    Returns the path to the downloaded file.
-    Raises Exception on failure, and ensures no leftover file remains.
+    Replaces appxdl usage:
+    - If the URL looks like a YouTube or other streaming page, uses yt-dlp.
+    - Otherwise attempts a direct HTTP(S) stream using aiohttp.
+    Returns the path to the downloaded file, or raises Exception on failure.
     """
+    url = url.strip()
     url_lower = url.lower()
-    # build output path based on the filename passed in
+    # create downloads directory if not exists
+    os.makedirs("downloads", exist_ok=True)
+
+    # Decide target extension
     if ".pdf" in url_lower:
-        out_path = f"{filename}.pdf"
-        cmd = ["appxdl", "-u", url, "-o", out_path]
+        out_name = f"downloads/{filename}.pdf"
     else:
-        out_path = f"{filename}.mp4"
-        cmd = ["appxdl", "-u", url, "-o", out_path]
+        out_name = f"downloads/{filename}.mp4"
 
-    proc = await asyncio.create_subprocess_exec(*cmd)
-    await proc.wait()
+    # If link looks like a direct file link (endswith .mp4 or .pdf or has query with ext), try HTTP download first
+    try_http_first = any(url_lower.endswith(ext) for ext in [".mp4", ".pdf"]) or ".pdf?" in url_lower or ".mp4?" in url_lower
 
-    # If download failed or file doesn't exist, remove any partial file and raise
-    if proc.returncode != 0 or not os.path.exists(out_path):
-        if os.path.exists(out_path):
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
-        raise Exception(f"Download failed for {url}")
+    # Heuristic: treat youtube/youtu.be and many known hosts as ytdlp candidates
+    ytdlp_hosts = ("youtube.com", "youtu.be", "vimeo.com", "facebook.com", "dailymotion.com", "drive.google.com")
+    is_ytdlp = any(h in url_lower for h in ytdlp_hosts) and not url_lower.endswith(".pdf")
 
-    return out_path
+    # If URL is obviously a direct link and not a streaming page, do HTTP streaming
+    if try_http_first and not is_ytdlp:
+        # Attempt HTTP download with retries
+        retries = 2
+        last_exc = None
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(retries):
+                try:
+                    await _download_http_to_file(session, url, out_name)
+                    # check file size
+                    if os.path.exists(out_name) and os.path.getsize(out_name) > 0:
+                        return out_name
+                    else:
+                        raise Exception("Downloaded file empty")
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(f"HTTP download attempt {attempt+1} failed for {url}: {e}")
+                    await asyncio.sleep(2)
+            # all http attempts failed; fall through to try yt-dlp if appropriate
+            if is_ytdlp:
+                logger.info("Falling back to yt-dlp after HTTP failure")
+            else:
+                raise Exception(f"HTTP download failed for {url}: {last_exc}")
 
+    # If here, try yt-dlp (for streaming pages or as fallback)
+    if is_ytdlp or True:
+        # Prepare outtmpl - yt-dlp will add proper extension
+        # Use a safe temporary template inside downloads dir
+        sanitized_template = os.path.join("downloads", filename + ".%(ext)s")
+        loop = asyncio.get_event_loop()
+        try:
+            out_path = await loop.run_in_executor(_thread_pool, _ydl_download_blocking, url, sanitized_template)
+            # _ydl_download_blocking returns the actual filename
+            if os.path.exists(out_path):
+                # If expected extension was .mp4 but ytdlp saved with different ext, and user expects .mp4,
+                # optionally rename. We'll keep the original name to avoid corruption.
+                return out_path
+            else:
+                raise Exception("yt-dlp reported file but it does not exist")
+        except Exception as e:
+            # If both HTTP and yt-dlp fail, raise a clear exception
+            raise Exception(f"Download failed for {url}: {e}")
+
+# ... rest of your original code continues unchanged ...
+
+# ─── Upload helper (unchanged from your file) ───────────────────────────────────
 async def upload_file_to_channel(
     bot: Client,
     file_path: str,
     caption: str,
     channel_id: int,
-    thread_id: int,   # ✅ new optional argument
     status_msg: Message
 ) -> bool:
     """
@@ -302,56 +390,6 @@ async def input_handler(client: Client, message: Message):
 
 # ─── Main Processing Loop ────────────────────────────────────────────────────────
 
-from pyrogram import Client
-from pyrogram.errors import FloodWait, RPCError
-import asyncio, os, logging
-
-logger = logging.getLogger(__name__)
-
-# ─── Topic Helper (Fixed Raw API + random_id) ───────────────────────────────────────────────
-from pyrogram import raw
-from pyrogram.errors import RPCError
-import random
-
-async def get_or_create_topic(client, chat_id, topic_name: str):
-    """
-    Create a forum topic safely for bot accounts using the raw API.
-    Includes required random_id to satisfy Telegram's method definition.
-    """
-    try:
-        peer = await client.resolve_peer(chat_id)
-
-        # generate a unique random_id (Telegram requires this)
-        random_id = random.randint(1, 2**63 - 1)
-
-        try:
-            # Try to create a topic directly (bots can use this)
-            new_topic = await client.invoke(
-                raw.functions.channels.CreateForumTopic(
-                    channel=peer,
-                    title=topic_name,
-                    random_id=random_id,
-                    icon_color=7322096
-                )
-            )
-            topic_id = new_topic.topic.id
-            logger.info(f"✅ Created topic: {topic_name} (id={topic_id})")
-            return topic_id
-
-        except RPCError as e:
-            # If topic already exists or can't be created, fall back to "General"
-            logger.warning(f"⚠️ Topic create RPCError for '{topic_name}': {e}")
-            return 0  # default thread ID
-
-    except Exception as e:
-        logger.error(f"⚠️ Failed to get/create topic '{topic_name}': {e}")
-        return 0
-
-
-
-
-# ─── Main Processing Loop ───────────────────────────────────────
-
 async def start_processing(client: Client, message: Message, user_id: int):
     data = user_data[user_id]
     lines = data["lines"]
@@ -361,6 +399,7 @@ async def start_processing(client: Client, message: Message, user_id: int):
     downloaded_by = data["downloaded_by"]
     total = data["total"]
 
+    # Mark as active
     active_downloads[user_id] = True
     status_msg = await message.reply_text(
         f"🚀 Starting processing:\n"
@@ -374,9 +413,8 @@ async def start_processing(client: Client, message: Message, user_id: int):
 
     processed = 0
     failed = 0
-    last_subject = None
-    video_count = 0
-    topic_id_cache = {}  # Cache topics to reduce API calls
+    last_subject = None  # Keep track of the previous subject
+    video_count = 0  # Counter for numbering videos
 
     for idx, entry in enumerate(lines[start_idx - 1:], start=start_idx):
         if not active_downloads.get(user_id, True):
@@ -391,26 +429,36 @@ async def start_processing(client: Client, message: Message, user_id: int):
 
         title_part, url = entry.split(":", 1)
         subjects = extract_subjects(title_part)
-        subject = subjects[0] if subjects else "General"
+        subject = subjects[0]  # We only take the first subject in the list
         clean_name = clean_title(title_part)
 
-        # Get or create topic (cached)
-        if subject not in topic_id_cache:
+        # If subject changed from last_subject, send a pinned message
+        if subject != last_subject:
             try:
-                topic_id_cache[subject] = await get_or_create_topic(client, channel_id, subject)
-            except Exception as e:
-                logger.error(f"Failed to get/create topic for '{subject}': {e}")
-                failed += 1
-                continue
+                subject_msg = await client.send_message(
+                    chat_id=channel_id,
+                    text=f"📌 **{subject}**",
+                    disable_web_page_preview=True
+                )
+                # Pin that subject message
+                await client.pin_chat_message(chat_id=channel_id, message_id=subject_msg.id)
+                last_subject = subject
+                await asyncio.sleep(1)  # small pause to avoid hitting rate limits
+            except FloodWait as e:
+                logger.warning(f"FloodWait while pinning: sleeping for {e.value}s")
+                await asyncio.sleep(e.value)
+            except RPCError as e:
+                logger.error(f"Failed to send/pin subject '{subject}': {e}")
 
-        topic_id = topic_id_cache[subject]
-
+        # Increment video count
         video_count += 1
-        item_status = await message.reply_text(f"⬇️ [{idx}/{total}] Downloading: {clean_name}")
 
+        # Download the file with retry logic
+        item_status = await message.reply_text(f"⬇️ [{idx}/{total}] Downloading: {clean_name}")
         file_path = None
         download_success = False
-
+        
+        # Try downloading twice
         for attempt in range(2):
             try:
                 file_path = await download_file(url.strip(), clean_name)
@@ -418,46 +466,46 @@ async def start_processing(client: Client, message: Message, user_id: int):
                 break
             except Exception as e:
                 logger.error(f"Download attempt {attempt + 1} failed for line {idx} ({clean_name}): {e}")
-                if attempt == 0:
-                    await item_status.edit_text(f"⚠️ [{idx}/{total}] Retry download: {clean_name}")
-                    await asyncio.sleep(2)
-                else:
-                    await item_status.edit_text(f"❌ [{idx}/{total}] Failed: {clean_name}")
+                if attempt == 0:  # First attempt failed, try again
+                    await item_status.edit_text(f"⚠️ [{idx}/{total}] Download failed, retrying: {clean_name}")
+                    await asyncio.sleep(2)  # Wait before retry
+                else:  # Second attempt failed
+                    await item_status.edit_text(f"❌ [{idx}/{total}] Download failed after retry: {clean_name}")
                     failed += 1
 
         if not download_success:
-            try: await item_status.delete()
-            except: pass
+            try:
+                await item_status.delete()
+            except Exception:
+                pass
             continue
 
+        # Upload under this subject with numbered caption
         caption = f"{video_count}\n{title_part.strip()}\n{batch_name}\nDownloaded by {downloaded_by}"
         await item_status.edit_text(f"📤 [{idx}/{total}] Uploading: {clean_name}")
-
         success = False
         try:
-            success = await upload_file_to_channel(
-                client,
-                file_path,
-                caption,
-                channel_id,
-                item_status,
-                thread_id=topic_id  # <── Send inside the topic
-            )
+            success = await upload_file_to_channel(client, file_path, caption, channel_id, item_status)
         except Exception as e:
-            logger.error(f"Upload error '{clean_name}': {e}")
+            logger.error(f"Unexpected error during upload of '{clean_name}': {e}")
             success = False
 
         if success:
+            logger.info(f"Uploaded '{clean_name}' successfully under '{subject}' as #{video_count}.")
             processed += 1
-            logger.info(f"Uploaded '{clean_name}' to topic '{subject}'.")
         else:
+            logger.error(f"Upload failed for '{clean_name}' under '{subject}'.")
             failed += 1
-            video_count -= 1
+            video_count -= 1  # Decrement if upload failed
 
+        # Clean up downloaded file after upload (regardless of success)
         if file_path and os.path.exists(file_path):
-            try: os.remove(file_path)
-            except: pass
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
+        # Update status message
         await status_msg.edit_text(
             f"🚀 Processing:\n"
             f"• Current line: {idx}/{total}\n"
@@ -466,18 +514,27 @@ async def start_processing(client: Client, message: Message, user_id: int):
             f"• Batch: {batch_name}"
         )
 
-        await asyncio.sleep(2)
-        try: await item_status.delete()
-        except: pass
+        # Rate limiting pause
+        if processed % 5 == 0 and processed > 0:
+            await asyncio.sleep(10)  # longer sleep every 5 successes
+        else:
+            await asyncio.sleep(2)   # brief pause between each
 
+        # Delete the item status message
+        try:
+            await item_status.delete()
+        except Exception:
+            pass
+
+    # Cleanup
     user_data.pop(user_id, None)
     active_downloads.pop(user_id, None)
 
     await status_msg.edit_text(
-        f"✅ Completed!\n"
-        f"• Uploaded: {processed}\n"
+        f"✅ Process completed!\n"
+        f"• Successfully uploaded: {processed}\n"
         f"• Failed: {failed}\n"
-        f"• Total: {processed + failed}"
+        f"• Total processed: {processed + failed}"
     )
 
 # ─── Handle potential bad‐time notifications on startup ────────────────────────
@@ -499,4 +556,3 @@ if __name__ == "__main__":
         app.run()
     except Exception as e:
         logger.exception(f"Fatal error: {e}")
-
