@@ -126,6 +126,7 @@ async def upload_file_to_channel(
     file_path: str,
     caption: str,
     channel_id: int,
+    thread_id: int,   # ✅ new optional argument
     status_msg: Message
 ) -> bool:
     """
@@ -301,6 +302,56 @@ async def input_handler(client: Client, message: Message):
 
 # ─── Main Processing Loop ────────────────────────────────────────────────────────
 
+from pyrogram import Client
+from pyrogram.errors import FloodWait, RPCError
+import asyncio, os, logging
+
+logger = logging.getLogger(__name__)
+
+# ─── Topic Helper (Fixed Raw API + random_id) ───────────────────────────────────────────────
+from pyrogram import raw
+from pyrogram.errors import RPCError
+import random
+
+async def get_or_create_topic(client, chat_id, topic_name: str):
+    """
+    Create a forum topic safely for bot accounts using the raw API.
+    Includes required random_id to satisfy Telegram's method definition.
+    """
+    try:
+        peer = await client.resolve_peer(chat_id)
+
+        # generate a unique random_id (Telegram requires this)
+        random_id = random.randint(1, 2**63 - 1)
+
+        try:
+            # Try to create a topic directly (bots can use this)
+            new_topic = await client.invoke(
+                raw.functions.channels.CreateForumTopic(
+                    channel=peer,
+                    title=topic_name,
+                    random_id=random_id,
+                    icon_color=7322096
+                )
+            )
+            topic_id = new_topic.topic.id
+            logger.info(f"✅ Created topic: {topic_name} (id={topic_id})")
+            return topic_id
+
+        except RPCError as e:
+            # If topic already exists or can't be created, fall back to "General"
+            logger.warning(f"⚠️ Topic create RPCError for '{topic_name}': {e}")
+            return 0  # default thread ID
+
+    except Exception as e:
+        logger.error(f"⚠️ Failed to get/create topic '{topic_name}': {e}")
+        return 0
+
+
+
+
+# ─── Main Processing Loop ───────────────────────────────────────
+
 async def start_processing(client: Client, message: Message, user_id: int):
     data = user_data[user_id]
     lines = data["lines"]
@@ -310,7 +361,6 @@ async def start_processing(client: Client, message: Message, user_id: int):
     downloaded_by = data["downloaded_by"]
     total = data["total"]
 
-    # Mark as active
     active_downloads[user_id] = True
     status_msg = await message.reply_text(
         f"🚀 Starting processing:\n"
@@ -324,8 +374,9 @@ async def start_processing(client: Client, message: Message, user_id: int):
 
     processed = 0
     failed = 0
-    last_subject = None  # Keep track of the previous subject
-    video_count = 0  # Counter for numbering videos
+    last_subject = None
+    video_count = 0
+    topic_id_cache = {}  # Cache topics to reduce API calls
 
     for idx, entry in enumerate(lines[start_idx - 1:], start=start_idx):
         if not active_downloads.get(user_id, True):
@@ -340,36 +391,26 @@ async def start_processing(client: Client, message: Message, user_id: int):
 
         title_part, url = entry.split(":", 1)
         subjects = extract_subjects(title_part)
-        subject = subjects[0]  # We only take the first subject in the list
+        subject = subjects[0] if subjects else "General"
         clean_name = clean_title(title_part)
 
-        # If subject changed from last_subject, send a pinned message
-        if subject != last_subject:
+        # Get or create topic (cached)
+        if subject not in topic_id_cache:
             try:
-                subject_msg = await client.send_message(
-                    chat_id=channel_id,
-                    text=f"📌 **{subject}**",
-                    disable_web_page_preview=True
-                )
-                # Pin that subject message
-                await client.pin_chat_message(chat_id=channel_id, message_id=subject_msg.id)
-                last_subject = subject
-                await asyncio.sleep(1)  # small pause to avoid hitting rate limits
-            except FloodWait as e:
-                logger.warning(f"FloodWait while pinning: sleeping for {e.value}s")
-                await asyncio.sleep(e.value)
-            except RPCError as e:
-                logger.error(f"Failed to send/pin subject '{subject}': {e}")
+                topic_id_cache[subject] = await get_or_create_topic(client, channel_id, subject)
+            except Exception as e:
+                logger.error(f"Failed to get/create topic for '{subject}': {e}")
+                failed += 1
+                continue
 
-        # Increment video count
+        topic_id = topic_id_cache[subject]
+
         video_count += 1
-
-        # Download the file with retry logic
         item_status = await message.reply_text(f"⬇️ [{idx}/{total}] Downloading: {clean_name}")
+
         file_path = None
         download_success = False
-        
-        # Try downloading twice
+
         for attempt in range(2):
             try:
                 file_path = await download_file(url.strip(), clean_name)
@@ -377,46 +418,46 @@ async def start_processing(client: Client, message: Message, user_id: int):
                 break
             except Exception as e:
                 logger.error(f"Download attempt {attempt + 1} failed for line {idx} ({clean_name}): {e}")
-                if attempt == 0:  # First attempt failed, try again
-                    await item_status.edit_text(f"⚠️ [{idx}/{total}] Download failed, retrying: {clean_name}")
-                    await asyncio.sleep(2)  # Wait before retry
-                else:  # Second attempt failed
-                    await item_status.edit_text(f"❌ [{idx}/{total}] Download failed after retry: {clean_name}")
+                if attempt == 0:
+                    await item_status.edit_text(f"⚠️ [{idx}/{total}] Retry download: {clean_name}")
+                    await asyncio.sleep(2)
+                else:
+                    await item_status.edit_text(f"❌ [{idx}/{total}] Failed: {clean_name}")
                     failed += 1
 
         if not download_success:
-            try:
-                await item_status.delete()
-            except Exception:
-                pass
+            try: await item_status.delete()
+            except: pass
             continue
 
-        # Upload under this subject with numbered caption
         caption = f"{video_count}\n{title_part.strip()}\n{batch_name}\nDownloaded by {downloaded_by}"
         await item_status.edit_text(f"📤 [{idx}/{total}] Uploading: {clean_name}")
+
         success = False
         try:
-            success = await upload_file_to_channel(client, file_path, caption, channel_id, item_status)
+            success = await upload_file_to_channel(
+                client,
+                file_path,
+                caption,
+                channel_id,
+                item_status,
+                thread_id=topic_id  # <── Send inside the topic
+            )
         except Exception as e:
-            logger.error(f"Unexpected error during upload of '{clean_name}': {e}")
+            logger.error(f"Upload error '{clean_name}': {e}")
             success = False
 
         if success:
-            logger.info(f"Uploaded '{clean_name}' successfully under '{subject}' as #{video_count}.")
             processed += 1
+            logger.info(f"Uploaded '{clean_name}' to topic '{subject}'.")
         else:
-            logger.error(f"Upload failed for '{clean_name}' under '{subject}'.")
             failed += 1
-            video_count -= 1  # Decrement if upload failed
+            video_count -= 1
 
-        # Clean up downloaded file after upload (regardless of success)
         if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            try: os.remove(file_path)
+            except: pass
 
-        # Update status message
         await status_msg.edit_text(
             f"🚀 Processing:\n"
             f"• Current line: {idx}/{total}\n"
@@ -425,27 +466,18 @@ async def start_processing(client: Client, message: Message, user_id: int):
             f"• Batch: {batch_name}"
         )
 
-        # Rate limiting pause
-        if processed % 5 == 0 and processed > 0:
-            await asyncio.sleep(10)  # longer sleep every 5 successes
-        else:
-            await asyncio.sleep(2)   # brief pause between each
+        await asyncio.sleep(2)
+        try: await item_status.delete()
+        except: pass
 
-        # Delete the item status message
-        try:
-            await item_status.delete()
-        except Exception:
-            pass
-
-    # Cleanup
     user_data.pop(user_id, None)
     active_downloads.pop(user_id, None)
 
     await status_msg.edit_text(
-        f"✅ Process completed!\n"
-        f"• Successfully uploaded: {processed}\n"
+        f"✅ Completed!\n"
+        f"• Uploaded: {processed}\n"
         f"• Failed: {failed}\n"
-        f"• Total processed: {processed + failed}"
+        f"• Total: {processed + failed}"
     )
 
 # ─── Handle potential bad‐time notifications on startup ────────────────────────
@@ -467,3 +499,4 @@ if __name__ == "__main__":
         app.run()
     except Exception as e:
         logger.exception(f"Fatal error: {e}")
+
