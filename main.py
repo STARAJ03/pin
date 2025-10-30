@@ -491,10 +491,25 @@ async def start_processing(client: Client, message: Message, user_id: int):
                     failed += 1
 
         if not download_success:
-            try:
-                await item_status.delete()
-            except Exception:
-                pass
+            # If it's a YouTube or streaming link, send the URL instead
+            if any(x in url.lower() for x in ["youtube.com", "youtu.be", "vimeo.com", "facebook.com", "dailymotion.com"]):
+                try:
+                    caption_link = f"{video_count}\n{title_part.strip()}\n{batch_name}\n{url.strip()}\nDownloaded by {downloaded_by}"
+                    await client.send_message(
+                        chat_id=channel_id,
+                        text=caption_link,
+                        disable_web_page_preview=False,
+                        reply_to_message_id=None
+                    )
+                    logger.info(f"Sent fallback YouTube link for {clean_name}")
+                except Exception as e:
+                    logger.error(f"Failed to send YouTube fallback link for {clean_name}: {e}")
+            else:
+                try:
+                    await item_status.edit_text(f"❌ [{idx}/{total}] Download failed for {clean_name}")
+                except Exception:
+                    pass
+            failed += 1
             continue
 
         # Upload under this subject with numbered caption
