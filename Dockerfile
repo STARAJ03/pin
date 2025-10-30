@@ -13,14 +13,16 @@ ENV PYTHONUNBUFFERED=1 \
 # ──────────────────────────────────────────────
 #  System dependencies
 # ──────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    git \
-    curl \
-    wget \
-    tzdata \
- && apt-get clean \
- && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir \
+    pyrogram \
+    tgcrypto \
+    yt-dlp \
+    aiohttp \
+    aiofiles \
+    requests \
+    flask \
+    waitress
+
 
 # ──────────────────────────────────────────────
 #  Copy project files
