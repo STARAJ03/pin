@@ -4,3 +4,5 @@ asyncio
 yt-dlp
 aiohttp
 aiofiles
+ffmpeg
+ffprobe
